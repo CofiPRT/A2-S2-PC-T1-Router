@@ -1,0 +1,315 @@
+--- PROTOCOALE DE COMUNICATIE ---
+-------- TEMA 1 - Router --------
+
+     _ __      _,.----.   
+  .-`.' ,`.  .' .' -   \  
+ /==/, -   \/==/  ,  ,-'  
+|==| _ .=. ||==|-   |  .  
+|==| , '=',||==|_   `-' \ 
+|==|-  '..' |==|   _  , | 
+|==|,  |    \==\.       / 
+/==/ - |     `-.`.___.-'  
+`--`---'                  
+
+Cuprins:
+	1. Biblioteci
+	2. Structuri
+	3. Modularizare
+		3.1. Fisierele "utils.*"
+		3.2. Fisierele "rtable.*"
+		3.3. Fisierele "arp_support.*"
+		3.4. Fisierele "ip_support.*"
+		3.5. Fisierul "router.c"
+	4. Alte detalii
+
+
+--- --------------------------- ---
+--- 1. Biblioteci si define-uri ---
+--- --------------------------- ---
+	Sunt incluse toate bibliotecile care erau deja in fisierul skel.h cu
+	exceptia:
+		* "netinet/if_ether.h", pentru uzitarea structurii 'ether_arp'
+		
+		* "signal.h", pentru maparea semnalelor linux la un handler ce incheie
+			mai "frumos" executia procesului; detalii discutate in "utils.*"
+
+
+--- ------------ ---
+--- 2. Structuri ---
+--- ------------ ---
+	* rtable_entry (in rtable.h)
+		- Reprezinta o intrare din tabela de rutare ce include doar nexthop-ul
+		si interfata. Explicatii mai jos
+
+	* rtable_node (in rtable.h)
+		- Pentru reprezentarea tabelei de rutare folosesc un trie, unde latimea
+		lui (stocarea) creste cu n (O(n)), dar inaltimea lui este de maximum
+		32 de nivele (pt fiecare bit), astfel parcurgerea se realizeaza in mod
+		constant O(32) = O(1).
+
+		- Pornind de la o radacina, fiecare nod (inclus radacina) are 2 copii:
+			* zero: pentru urmatorul bit 0
+			* one: pentru urmatorul bit 1
+
+		- Astfel, la parsarea tabelei de rutare, se stocheaza sub aceasta forma
+		o intrare dupa rezultatul 'prefix & mask'. Anume, in trie se introduc
+		primii 'mask' biti din 'prefix'.
+
+		- Doar nodul final al unei stocari de tipul precedent prezinta o
+		intrare 'rtable_entry', astfel cu cat parcurgem mai mult in adancime
+		trie-ul, daca un nod prezinta o intrare, inseamna ca ea are cel mai lung
+		prefix de pana atunci.
+		
+		- Parcurgea trie-ului se opreste la un nod NULL. Daca se doreste
+		intrarea pe un bit 0, iar nodul curent are bit-ul 0 NULL, se opreste
+		parcurgerea iar intrarea 'rtable_entry' este data de ultima gasita
+		in trie.
+		
+		- Daca intrarea de tipul 'rtable_entry' ramane NULL dupa parcurgerea
+		trie-ului, inseamna ca nu s-a gasit un nexthop corespunzator
+		(destination unreachable).
+
+	* arp_entry (in arp_support.h)
+		- Tabela ARP este reprezentata sub forma unui binary tree (nu trie,
+		intrucat fiecare nod prezinta informatie)
+
+		- Campurile unei intrari (unui nod) sunt:
+			* status: SET sau WAITING
+				- Cand un ARP REQUEST a fost trimis pentru aceasta intrare, ea
+				asteapta un raspuns, in stadiul WAITING
+
+				- Dupa primirea unui raspuns, aceasta devine SET
+
+			* packet_queue
+				- Fiecare intrare in stadiul WAITING are o coada de pachete
+				ce asteapta ca ea sa fie SET. Astfel, la primirea unui raspuns,
+				aceste pachete pot fi dirijate.
+
+			* nexthop si mac_addr
+				- Asocierea oricarei tabele ARP dintre o adresa IP si adresa
+				mac aferenta acesteia
+
+			* left si right
+				- Copiii (nodurile) acestei intrari
+
+				- Aceasta tabela este de fapt un binary search tree sortat
+				dupa valoarea uint32_t a nexthop-ului
+
+				- Astfel, cautarea in aceasta tabela are o complexitate O(logn)
+
+
+--- --------------- ---
+--- 3. Modularizare ---
+--- --------------- ---
+
+=== 3.1. Fisierele utils.* ===
+
+	- In fisierul header 'utils.h' sunt prezente macro-uri pentru lungimi
+	de structuri header precum
+		* LEN_ETH -> ether_header
+		* LEN_ARP -> ether_arp
+		* LEN_IP -> iphdr
+		* LEN_ICMP -> icmphdr
+
+	- Totodata se regasesc macro-uri pentru cateva sume intre aceste lungimi,
+	ce ajuta la gasirea offset-ului unui anumit header intr-un payload
+		* exemplu:
+			- LEN_ICMP_START = LEN_ETH + LEN_IP, intrucat headerul ICMP
+			se afla dupa ambele headere
+
+	- Mai importante sunt macro-uri pentru cast-uri cu offset ale payload-ului
+	unui pachet
+		* exemplu:
+			- PACK_ICMP_HDR -> pointer (cu cast la structura icmphdr) catre
+			header-ul ICMP al unui payload dintr-un pachet
+
+	* Functia 'get_interface_ip_uint32_t'
+		- Este aproape identica cu functia 'get_interface_ip' oferita in skel.c,
+		cu exceptia faptului ca returneaza adresa in format intreg 'uint32_t' in
+		loc de string (de ce ai vrea asa ceva?)
+
+	* Functia 'checksum'
+		- Este functia 'checksum' din laboratorul 5, exceptand faptul ca am
+		adaugat aplicarea functiei 'htons' asupra rezultatului de 'return'
+
+	* Functia 'exit_gracefully'
+		- O functie handler asociata semnalelor SIGINT, SIGSEGV, SIGILL.
+
+		- Initial, am creat in program si un suport pentru stack trace, dar
+		era folosit doar pentru debug (apelata in cadrul acestei functii in
+		cazul SIGSEGV sau SIGILL)
+
+		- Se elibereaza memoria alocata dinamic.
+
+	* Functia 'init_signals'
+		- Asociaza semnalele SIGINT, SIGSEGV, SIGILL la functia de mai sus
+
+
+=== 3.2. Fisierele "rtable.*" ===
+
+	Fiind niste structuri de date, sunt prezente functii ce le aloca si,
+	eventual, ce le elibereaza memoria
+
+	* new_rtable_entry
+		- Aloca o intrare
+
+	* new_rtable_node
+		- Aloca un nod
+
+	* delete_rtable_node
+		- Elibereaza recursiv nodul primit si toti copiii acestuia
+
+	* add_rtable_entry
+		- Adauga o noua intrare a tabelei de rutare in trie, conform procedeului
+		prezentat in sectiunea '2. Structuri' (Linia ###)
+
+	* get_rtable_entry
+		- Cauta in tabela de rutare (conform structurii trie-ului) o intrare
+		ce are adresa IP data
+
+		- In cazul in care nu s-a gasit o astfel de intrare, se returneaza NULL
+
+	* parse_rtable
+		- Deschide fisierul cu intrarile tabelei de rutare si aplica functia
+		'add_rtable_entry' asupra fiecarei intrari
+
+	* delete_rtable
+		- Aplica functia 'delete_rtable_node' asupra radacinii trie-ului
+
+
+=== 3.3. Fisierele "arp_support.*"
+	
+	Fiind o structura de date, sunt prezente functii ce aloca si elibereaza
+	memoria. Fiind un tree, orice nod este si o intrare.
+
+	* new_arp_entry
+		- Aloca o intrare, initializand-o in stadiul WAITING, prezentat in
+		sectiunea '2. Structuri' (Linia ###)
+
+	* delete_arp_entry
+		- Elibereaza recursiv nodul primit si toti copiii acestuia
+
+	* add_arp_entry
+		- Adauga o noua intrare conform sortarii binary search tree, in
+		particular crescator dupa adresa IP a intrarii
+
+	* get_arp_entry
+		- Cauta conform structurii binary search tree-ului o intrare ce are
+		adresa IP data
+
+		- In cazul in care nu s-a gasit o astfel de intrare, se returneaza NULL
+
+	Functii legate de implementare pentru partea de ARP:
+
+	* check_ARP_header
+		- Verifica tipul ARP al pachetului primit pentru a redirectiona pachetul
+		unei functii adecvate
+			* ARPOP_REQUEST -> send_ARP_reply
+
+			* ARPOP_REPLY -> update_ARP_table
+
+	* send_ARP_reply
+		- Se creeaza un nou pachet de tipul ARP, mai precis ARPOP_REPLY
+
+		- Se fac toate atribuirile necesare unui astfel de mesaj, interschimband
+		eventual campuri din pachetul primit precum cele sursa si destinatie,
+		si oferind drept adresa mac sursa adresa interfetei prin care va pleca
+		acest pachet (conform procedeul de ARP request)
+
+	* send_ARP_request
+		- Se creeaza un nou pachet de tipul ARP, mai precis ARPOP_REQUEST
+
+		- Se fac toate atribuirile necesare unui astfel de mesaj, avand drept
+		destinatie o adresa IP a carui adresa MAC nu o stim, trimitand mesajul
+		drept boardcast (adresa mac destinatie = 0xffffffffffff)
+
+	* update_ARP_table
+		- La primirea unui ARP REPLY, se actualizeaza intrarea corespunzatoare
+		adresei de la care a venit reply-ul, aceasta ajungand din stadiul
+		WAITING in SET, prezentate in sectiunea '2. Structuri' (Linia ###)
+
+		- Astfel, procesele din coada acestei intrari care asteptau un raspuns
+		pot fi dirijate
+
+	* delete_ARP_table
+		- Aplica functia 'delete_arp_entry' asupra radacinii tree-ului
+
+
+=== 3.4. Fisierele "ip_support.*" ===
+
+	Sunt prezente functii legate de implementare pentru partea de IP (+ICMP):
+
+	* validate_IP_checksum si validate_ICMP_checksum
+		- Face pasii necesari pentru a calcula checksum-ul header-ului primit.
+
+		- Returneaza 1 daca este corect, 0 daca este gresit
+
+	* check_IP_header
+		- O functie "radacina" pentru tot ce tine de IP si ICMP
+
+		- Verifica checksum-uri, TTL, daca mesajul este destinat router-ului sau
+		un mesaj poate ajunge la o destinatie, organizand in acest timp aceste
+		mesaje (punandu-le in cozi, trimitand ARP request-uri etc.)
+
+		- Totodata, in functie de pasii prezentati mai sus, trimite, daca e
+		nevoie, un mesaj ICMP aferent.
+
+	* send_ICMP_reply
+		- Creeaza un nou pachet de tip IP:ICMP
+
+		- In functie de tipul pachetului ICMP, campurile mesajului sunt
+		atribuite diferit:
+			* ICMP_ECHOREPLY:
+				- Un astfel de mesaj trebuie sa contina exact data de dupa
+				header-ul ICMP a mesajului primit, astfel incat sursa sa poata
+				identifica raspunsul
+
+			* ICMP_DEST_UNREACH si ICMP_TIME_EXCEEDED:
+				- Un astfel de mesaj trebuie sa contina dupa header-ul ICMP
+				tot ce se afla dupa header-ul ethernet al mesajului sursa:
+					* header-ul IP
+					* header-ul ICMP
+					* data
+
+				- Acest lucru este necesar pentru ca sursa sa poata identifica
+				raspunsul
+
+	* forward
+		- Modifica header-ul ethernet si decrementeaza TTL-ul
+
+		- Modificarea checksum-ului se face conform RFC 1624
+			- In particular, intrucat modificarea campului ce se schimba este
+			pur si simplu o decrementare, conform formulei din RFC 1624, o alta
+			posibilitate de a modifica checksum-ul este de a-l incrementa
+
+			- Cu toate acestea, respect cerinta
+
+		- Trimite pachetul pe interfata aferenta
+
+
+=== 3.5. Fisierul "router.c" ===
+
+	- Se apeleaza functia din schelet init alaturi de functiile 'init_signals'
+	(Linia ###) si 'parse_rtable' (Linia ###)
+
+	- In loop, se asteapta primirea unui pachet dupa care, in functie de tipul
+	acestuia (ARP sau IP) se apeleaza functia aferenta
+		* tip ARP -> 'check_ARP_header' (Linia ###)
+
+		* tip IP -> 'check_IP_header' (Linia ###)
+
+
+--- --------------- ---
+--- 4. Alte detalii ---
+--- --------------- ---
+	- Avand in vedere simplitatea topologiei, am considerat varianta de a
+	actualiza tabela ARP la primirea oricarui mesaj (intrucat un mesaj cu o
+	anumita adresa IP sigur provine de la adresa MAC din ether header). Cu toate
+	acestea, am renuntat la idee pentru a simula un router real.
+
+	FEEDBACK:
+	- Consider ca ar fi trebuit sa avem un suport mai bun de informatii pentru
+	realizarea cerintelor, intrucat la cursuri si laboratoare se discuta
+	"conceptul", iar la teme se puncteaza codul propriu-zis (ma refer in
+	special la dificultatea de a afla cum trebuie completat absolut fiecare
+	camp necesar dintr-un anumit header, nu doar cele importante conceptului).
